@@ -1,0 +1,12 @@
+﻿UpdateCenter provenance
+=======================
+
+Fachliche Quelle:
+- Eingefrorener Altprojekt-Commit: 259cbfac272c47ac1a7828de973512d17b29ae10
+- Urspruenglicher Pfad: Code/System/Software/UpdateCenter
+
+Transfer in R4OS 0.64.18:
+- Quellcode, Manifest, Assets und vorhandene Projektdokumentation wurden
+  bytegenau aus dem eingefrorenen Commit uebernommen.
+- Das externe SDK-Modul $sdkModule wird ueber den benannten Pfad des
+  gepinnten SDK-Pakets aufgeloest. Fachcode und Manifest blieben unveraendert.

@@ -1,0 +1,16 @@
+﻿R4OS UPDATE - system update client
+
+Searches the configured R4OS update server and compares its catalog with
+the installed component inventory.
+
+Buttons:
+  Search for Updates   refresh the immutable update list
+  Update               download and install one atomic R4U package
+  Update All           process the complete dependency-ordered list
+  Restart R4OS         commit a fully prepared restart batch and reboot
+
+Update All downloads and verifies every required package before changing
+installed files. Packages are installed serially. A failure stops the queue
+and leaves later packages available for a retry.
+
+Closing this window does not cancel the service-owned update job.
