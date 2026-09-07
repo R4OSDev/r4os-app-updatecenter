@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.2.3`
+- Version: `0.2.4`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/UPDATE.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
