@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.2.2`
+- Version: `0.2.3`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/UPDATE.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -28,6 +28,12 @@ last verified standalone dependency identities; workspace builds use the
 mapped local checkouts.
 
 ## Documentation
+
+Result pages load through one asynchronous I/O request at a time. The window
+continues processing events, and a new list replaces the old list only when
+its complete generation has been validated. Offers include their first
+component; remaining components arrive in batches of up to eight. Full
+descriptions and all reported client dimensions are retained.
 
 Detailed German technical notes from the migration are preserved in
 `DOCUMENTATION.de.txt`. Source-transfer provenance is recorded in

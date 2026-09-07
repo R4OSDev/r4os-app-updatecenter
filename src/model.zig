@@ -191,6 +191,142 @@ pub const Model = struct {
     }
 };
 
+/// Private, incremental snapshot. The GUI publishes next only when done;
+/// errors discard the entire load, including any previously accepted pages.
+pub const Loader = struct {
+    next: Model = .{},
+    generation: u32 = 0,
+    total: u32 = 0,
+    result_index: u32 = 0,
+    component_index: u32 = 0,
+    done: bool = false,
+
+    pub fn start(self: *Loader, job_id: u32) void {
+        self.* = .{};
+        self.next.clearForSearch(job_id);
+    }
+
+    pub fn op(self: *const Loader) u16 {
+        return if (self.component_index == 0) contract.op_results_bundle else contract.op_component_batch;
+    }
+
+    pub fn request(self: *const Loader) contract.PageRequest {
+        return .{ .job_id = self.next.search_job_id, .generation = self.generation, .result_index = self.result_index, .component_index = self.component_index };
+    }
+
+    pub fn acceptBundle(self: *Loader, bundle: *const contract.ResultsBundle) bool {
+        const page = &bundle.page;
+        if (self.done or self.op() != contract.op_results_bundle or !bundle.valid() or
+            page.result != contract.result_ok or page.generation == 0 or
+            page.index != self.result_index or page.total > max_packages or
+            (self.generation != 0 and (page.generation != self.generation or page.total != self.total)) or
+            page.has_offer != @intFromBool(page.total != 0) or
+            (page.total == 0 and page.index != 0)) return false;
+        if (self.generation != 0 and !std.mem.eql(u8, self.next.currentReleaseText(), page.currentReleaseText())) return false;
+        if (self.next.component_count + page.offer.component_count > max_components) return false;
+        if (!self.next.acceptResultPage(page)) return false;
+        self.generation = page.generation;
+        self.total = page.total;
+        if (page.total == 0) {
+            self.done = true;
+            return true;
+        }
+        if (page.offer.component_count != 0) {
+            const component = contract.ComponentPage{ .job_id = page.job_id, .result_index = page.index, .total = page.offer.component_count, .has_component = 1, .component = bundle.first_component };
+            if (!self.next.acceptComponentPage(&component)) return false;
+            self.component_index = 1;
+        }
+        self.advance();
+        return true;
+    }
+
+    pub fn acceptBatch(self: *Loader, batch: *const contract.ComponentBatch) bool {
+        if (self.done or self.op() != contract.op_component_batch or !batch.valid() or
+            batch.job_id != self.next.search_job_id or batch.generation != self.generation or
+            batch.result_index != self.result_index or batch.component_index != self.component_index or
+            batch.total != self.next.packages[self.result_index].offer.component_count or
+            batch.count != @min(contract.component_batch_capacity, batch.total - batch.component_index) or
+            self.next.component_count + batch.count > max_components) return false;
+        for (batch.components[0..batch.count], 0..) |component, i| {
+            const page = contract.ComponentPage{ .job_id = batch.job_id, .result_index = batch.result_index, .component_index = batch.component_index + @as(u32, @intCast(i)), .total = batch.total, .has_component = 1, .component = component };
+            if (!self.next.acceptComponentPage(&page)) return false;
+        }
+        self.component_index += batch.count;
+        self.advance();
+        return true;
+    }
+
+    fn advance(self: *Loader) void {
+        if (self.component_index != self.next.packages[self.result_index].offer.component_count) return;
+        self.result_index += 1;
+        self.component_index = 0;
+        self.done = self.result_index == self.total;
+    }
+};
+
+test "batched loading halves calls for 64 packages and 192 components" {
+    var loader = Loader{};
+    loader.start(17);
+    var calls: usize = 0;
+    while (!loader.done) {
+        const request = loader.request();
+        if (loader.op() == contract.op_results_bundle) {
+            var bundle = contract.ResultsBundle{ .page = .{
+                .job_id = 17,
+                .generation = 23,
+                .index = request.result_index,
+                .total = 64,
+                .has_offer = 1,
+                .offer = .{ .component_count = 3 },
+            } };
+            bundle.page.offer.description_len = contract.offer_description_capacity;
+            @memset(&bundle.page.offer.description, 'a');
+            try std.testing.expect(loader.acceptBundle(&bundle));
+        } else {
+            const batch = contract.ComponentBatch{ .job_id = 17, .generation = 23, .result_index = request.result_index, .component_index = 1, .total = 3, .count = 2 };
+            try std.testing.expect(loader.acceptBatch(&batch));
+        }
+        calls += 1;
+        try std.testing.expect(calls <= 128);
+    }
+    try std.testing.expectEqual(@as(usize, 128), calls);
+    try std.testing.expectEqual(@as(usize, 64), loader.next.package_count);
+    try std.testing.expectEqual(@as(usize, 192), loader.next.component_count);
+    for (loader.next.packages, 0..) |package, i| {
+        try std.testing.expectEqual(@as(u16, @intCast(i * 3)), package.component_start);
+        try std.testing.expectEqual(@as(u16, 3), package.component_count);
+        try std.testing.expectEqual(@as(u16, 2048), package.offer.description_len);
+    }
+}
+
+test "batched loading rejects changed snapshots gaps and overflow and restarts empty" {
+    var loader = Loader{};
+    loader.start(17);
+    const bundle = contract.ResultsBundle{ .page = .{ .job_id = 17, .generation = 23, .total = 1, .has_offer = 1, .offer = .{ .component_count = 10 } } };
+    try std.testing.expect(loader.acceptBundle(&bundle));
+    var batch = contract.ComponentBatch{ .job_id = 17, .generation = 24, .component_index = 1, .total = 10, .count = 8 };
+    try std.testing.expect(!loader.acceptBatch(&batch));
+    batch.generation = 23;
+    batch.component_index = 2;
+    try std.testing.expect(!loader.acceptBatch(&batch));
+    batch.component_index = 1;
+    batch.count = 9;
+    try std.testing.expect(!loader.acceptBatch(&batch));
+    batch.count = 8;
+    try std.testing.expect(loader.acceptBatch(&batch));
+    batch.component_index = 9;
+    batch.count = 1;
+    try std.testing.expect(loader.acceptBatch(&batch));
+    try std.testing.expect(loader.done);
+    try std.testing.expect(!loader.acceptBatch(&batch));
+    loader.start(18);
+    try std.testing.expect(!loader.acceptBundle(&bundle));
+    const empty = contract.ResultsBundle{ .page = .{ .job_id = 18, .generation = 1 } };
+    try std.testing.expect(loader.acceptBundle(&empty));
+    try std.testing.expect(loader.done);
+    try std.testing.expectEqual(@as(usize, 0), loader.next.package_count);
+}
+
 pub fn stateText(state: SessionState) []const u8 {
     return switch (state) {
         .available => "Available",

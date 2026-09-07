@@ -8,8 +8,6 @@ const call_timeout_ns: u64 = 2_000_000_000;
 const poll_loops: u16 = 12;
 const minimum_width: i32 = 760;
 const minimum_height: i32 = 480;
-const maximum_width: i32 = 1600;
-const maximum_height: i32 = 1000;
 const margin: i32 = 12;
 const header_h: i32 = 54;
 const status_h: i32 = 24;
@@ -92,6 +90,13 @@ const App = struct {
     status_len: usize = 0,
     status_is_error: bool = false,
     restart_ready: bool = false,
+    loading: bool = false,
+    loader: model.Loader = .{},
+    load_io: u32 = 0,
+    load_request: contract.PageRequest = .{},
+    load_header: r4os.abi.ServiceMessageHeader = .{},
+    load_response: [r4os.abi.service_api_max_payload]u8 align(8) = undefined,
+    last_status: ?contract.Status = null,
 
     fn run(self: *App) i32 {
         if (self.ctx.desk.programWindowId() < 0) {
@@ -105,6 +110,11 @@ const App = struct {
         self.recoverServiceState();
         self.render();
         defer self.closeConnection();
+        // Buffers are static App storage. Close releases the outstanding I/O;
+        // owner teardown also covers a failed close during program exit.
+        defer if (self.load_io != 0) {
+            _ = self.ctx.sys.ioClose(self.load_io);
+        };
 
         while (!self.ctx.sys.programShouldClose() and !self.should_exit) {
             var event: r4os.abi.GuiEvent = .{};
@@ -123,10 +133,11 @@ const App = struct {
                     else => {},
                 }
             }
+            self.pollResults();
             self.poll_counter +%= 1;
             if (self.poll_counter >= poll_loops) {
                 self.poll_counter = 0;
-                if (self.active_job != 0 or self.service_busy) {
+                if (!self.loading and self.load_io == 0 and (self.active_job != 0 or self.service_busy)) {
                     self.refreshStatus();
                     self.render();
                 }
@@ -140,8 +151,8 @@ const App = struct {
         var info: r4os.abi.GuiWindowInfo = .{};
         _ = self.ctx.desk.guiWindowInfo(&info);
         const canvas = r4os.gui.Canvas.init(&self.ctx.draw, info);
-        self.w = clampI32(canvas.w, minimum_width, maximum_width);
-        self.h = clampI32(canvas.h, minimum_height, maximum_height);
+        self.w = @max(canvas.w, minimum_width);
+        self.h = @max(canvas.h, minimum_height);
     }
 
     fn closeConnection(self: *App) void {
@@ -207,6 +218,7 @@ const App = struct {
     }
 
     fn applyServiceStatus(self: *App, status: contract.Status, recovering: bool) void {
+        self.last_status = status;
         const state = contract.stateFromWire(status.state) orelse {
             self.setStatus("Update Service returned an unknown state.", true);
             return;
@@ -282,7 +294,7 @@ const App = struct {
     }
 
     fn beginSearch(self: *App) void {
-        if (self.service_busy) return;
+        if (self.service_busy or self.loading or self.load_io != 0) return;
         const connection = self.connectionPtr() orelse return;
         const request = contract.CommandRequest{};
         switch (connection.callTyped(
@@ -317,7 +329,7 @@ const App = struct {
     }
 
     fn beginSnapshotOperation(self: *App, operation: u16) void {
-        if (self.service_busy or self.data.search_job_id == 0) return;
+        if (self.service_busy or self.loading or self.load_io != 0 or self.data.search_job_id == 0) return;
         if (operation == contract.op_update_all and !self.data.updateAllEnabled(false)) return;
         if (operation == contract.op_restart and !self.restart_ready) return;
         const connection = self.connectionPtr() orelse return;
@@ -349,7 +361,7 @@ const App = struct {
     }
 
     fn beginUpdate(self: *App, package_index: usize) void {
-        if (!self.data.actionEnabled(package_index, self.service_busy)) return;
+        if (!self.data.actionEnabled(package_index, self.service_busy or self.loading or self.load_io != 0)) return;
         if (self.data.packages[package_index].state == .downloaded) {
             self.beginInstall(package_index);
             return;
@@ -434,89 +446,77 @@ const App = struct {
     }
 
     fn loadResults(self: *App, search_job_id: u32) void {
-        if (search_job_id == 0) return;
-        const connection = self.connectionPtr() orelse return;
-        var next = model.Model{};
-        next.clearForSearch(search_job_id);
-        var result_index: u32 = 0;
-        while (result_index < model.max_packages) : (result_index += 1) {
-            const request = contract.ResultsRequest{ .job_id = search_job_id, .index = result_index };
-            const page = switch (connection.callTyped(
-                contract.ResultsRequest,
-                contract.ResultsPage,
-                contract.op_results,
-                &request,
-                callTimeout(),
-            )) {
-                .value => |value| value,
-                .timed_out => {
-                    self.setStatus("Loading update results timed out.", true);
-                    return;
-                },
-                .remote_failure => |raw| {
-                    self.setCodeStatus("Update results unavailable", raw);
-                    return;
-                },
-                .failure => |raw| {
-                    self.setCodeStatus("Update result connection failed", raw);
-                    return;
-                },
-            };
-            if (!next.acceptResultPage(&page)) {
-                self.setStatus("Update Service returned invalid result data.", true);
-                return;
-            }
-            if (page.total == 0) break;
-            if (!self.loadComponents(connection, &next, search_job_id, result_index, page.offer.component_count)) return;
-            if (result_index + 1 >= page.total) break;
-        }
-        self.data = next;
-        self.component_scroll = 0;
-        self.clampSelection();
+        if (search_job_id == 0 or self.loading or self.load_io != 0) return;
+        self.loader.start(search_job_id);
+        self.loading = true;
     }
 
-    fn loadComponents(
-        self: *App,
-        connection: *r4os.ServiceConnection,
-        next: *model.Model,
-        search_job_id: u32,
-        result_index: u32,
-        count: u16,
-    ) bool {
-        var component_index: u32 = 0;
-        while (component_index < count) : (component_index += 1) {
-            const request = contract.ComponentRequest{
-                .job_id = search_job_id,
-                .result_index = result_index,
-                .component_index = component_index,
+    fn loadFailed(self: *App, code: i32) void {
+        self.loading = false;
+        self.closeConnection();
+        self.setCodeStatus("Update list changed or could not be loaded; search again", code);
+        self.render();
+    }
+
+    fn pollResults(self: *App) void {
+        if (self.load_io != 0) {
+            var info: r4os.abi.ProgramIoInfo = .{};
+            const status = self.ctx.sys.ioStatus(self.load_io, &info);
+            if (status == r4os.abi.io_ok and info.state != r4os.abi.io_state_completed and
+                info.state != r4os.abi.io_state_failed) return;
+            const closed = self.ctx.sys.ioClose(self.load_io);
+            if (closed != r4os.abi.io_ok and closed != r4os.abi.io_error_not_found) return;
+            self.load_io = 0;
+            if (status != r4os.abi.io_ok or info.state != r4os.abi.io_state_completed or
+                info.result < 0 or self.load_header.status != contract.result_ok)
+            {
+                self.loadFailed(if (status != r4os.abi.io_ok) status else if (info.result < 0) info.result else self.load_header.status);
+                return;
+            }
+            const accepted = if (self.loader.op() == contract.op_results_bundle) result: {
+                if (info.result != @sizeOf(contract.ResultsBundle)) break :result false;
+                const bundle: *const contract.ResultsBundle = @ptrCast(&self.load_response);
+                break :result self.loader.acceptBundle(bundle);
+            } else result: {
+                if (info.result != @sizeOf(contract.ComponentBatch)) break :result false;
+                const batch: *const contract.ComponentBatch = @ptrCast(&self.load_response);
+                break :result self.loader.acceptBatch(batch);
             };
-            const page = switch (connection.callTyped(
-                contract.ComponentRequest,
-                contract.ComponentPage,
-                contract.op_components,
-                &request,
-                callTimeout(),
-            )) {
-                .value => |value| value,
-                .timed_out => {
-                    self.setStatus("Loading package components timed out.", true);
-                    return false;
-                },
-                .remote_failure => |raw| {
-                    self.setCodeStatus("Package components unavailable", raw);
-                    return false;
-                },
-                .failure => |raw| {
-                    self.setCodeStatus("Component connection failed", raw);
-                    return false;
-                },
-            };
-            if (!next.acceptComponentPage(&page)) {
-                self.setStatus("Update Service returned invalid component data.", true);
-                return false;
+            if (!accepted) {
+                self.loadFailed(contract.result_selection_stale);
+                return;
+            }
+            if (self.loader.done) {
+                self.data = self.loader.next;
+                self.loading = false;
+                self.component_scroll = 0;
+                self.clampSelection();
+                // A reopened download may already have completed while the
+                // list was loading. Reconcile it only after publication.
+                if (self.last_status) |last| {
+                    if ((last.operation == contract.op_download or last.operation == contract.op_install) and
+                        last.source_job_id == self.data.search_job_id) self.applyServiceStatus(last, false);
+                }
+                self.render();
+                return;
             }
         }
-        return true;
+        if (!self.loading) return;
+        const connection = self.connectionPtr() orelse {
+            self.loading = false;
+            return;
+        };
+        self.load_request = self.loader.request();
+        self.load_header = .{};
+        const size: usize = if (self.loader.op() == contract.op_results_bundle)
+            @sizeOf(contract.ResultsBundle)
+        else
+            @sizeOf(contract.ComponentBatch);
+        const rc = self.ctx.sys.ioServiceCall(connection.raw, self.loader.op(), std.mem.asBytes(&self.load_request), &self.load_header, self.load_response[0..size], self.ctx.sys.ticksFromMilliseconds(2000), 0, &self.load_io);
+        if (rc != r4os.abi.io_ok) {
+            self.load_io = 0;
+            self.loadFailed(rc);
+        }
     }
 
     fn render(self: *App) void {
@@ -609,7 +609,7 @@ const App = struct {
         _ = canvas.button(.{
             .rect = self.packageUpdateRect(visible_index),
             .text = self.data.actionLabel(package_index),
-            .state = if (!self.data.actionEnabled(package_index, self.service_busy)) .disabled else if (self.pressed == .update and self.pressed_package == package_index) .pressed else .normal,
+            .state = if (!self.data.actionEnabled(package_index, self.service_busy or self.loading or self.load_io != 0)) .disabled else if (self.pressed == .update and self.pressed_package == package_index) .pressed else .normal,
             .palette = palette,
         }, scratch);
     }
