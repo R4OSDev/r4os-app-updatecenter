@@ -89,7 +89,7 @@ const App = struct {
     status: [192]u8 = .{0} ** 192,
     status_len: usize = 0,
     status_is_error: bool = false,
-    restart_ready: bool = false,
+    restart: model.RestartBinding = .{},
     loading: bool = false,
     loader: model.Loader = .{},
     load_io: u32 = 0,
@@ -224,6 +224,7 @@ const App = struct {
             return;
         };
         self.service_busy = (status.flags & contract.flag_busy) != 0;
+        self.restart.observe(status);
         if (status.operation == contract.op_search) {
             self.active_job = if (self.service_busy) status.job_id else 0;
             if (self.data.search_job_id == 0 and status.job_id != 0 and
@@ -257,8 +258,6 @@ const App = struct {
                 self.active_package = package_index;
             }
             self.active_job = if (self.service_busy) status.job_id else 0;
-            if (status.operation == contract.op_install)
-                self.restart_ready = model.Model.restartReadyFromStatus(status, self.service_busy);
             self.setContractStatus(status, state == .failed or state == .interrupted or state == .cancelled);
             if (status.operation == contract.op_download and state == .downloaded and
                 package_index < self.data.package_count and self.install_attempted_for_job != status.job_id)
@@ -277,13 +276,14 @@ const App = struct {
             if (status.result_index < self.data.package_count)
                 _ = self.data.updatePackage(status.result_index, status);
             self.active_job = if (self.service_busy) status.job_id else 0;
-            self.restart_ready = model.Model.restartReadyFromStatus(status, self.service_busy);
             if (!self.service_busy and status.source_job_id != 0) self.loadResults(status.source_job_id);
             self.setContractStatus(status, state == .failed or state == .interrupted or state == .cancelled);
             return;
         }
 
         if (status.operation == contract.op_restart) {
+            if (status.source_job_id != 0 and self.data.search_job_id != status.source_job_id)
+                self.loadResults(status.source_job_id);
             self.active_job = if (self.service_busy) status.job_id else 0;
             self.setContractStatus(status, state == .failed or state == .interrupted or state == .cancelled);
             return;
@@ -294,7 +294,7 @@ const App = struct {
     }
 
     fn beginSearch(self: *App) void {
-        if (self.service_busy or self.loading or self.load_io != 0) return;
+        if (!self.restart.searchEnabled(self.service_busy or self.loading or self.load_io != 0)) return;
         const connection = self.connectionPtr() orelse return;
         const request = contract.CommandRequest{};
         switch (connection.callTyped(
@@ -312,6 +312,7 @@ const App = struct {
                 // The accepted job is active, but its result pages do not
                 // exist yet. Binding the empty model here would make the
                 // completion path mistake it for an already loaded snapshot.
+                self.restart = .{};
                 self.data.clearForPendingSearch();
                 self.component_scroll = 0;
                 self.active_job = ack.job_id;
@@ -331,9 +332,11 @@ const App = struct {
     fn beginSnapshotOperation(self: *App, operation: u16) void {
         if (self.service_busy or self.loading or self.load_io != 0 or self.data.search_job_id == 0) return;
         if (operation == contract.op_update_all and !self.data.updateAllEnabled(false)) return;
-        if (operation == contract.op_restart and !self.restart_ready) return;
         const connection = self.connectionPtr() orelse return;
-        const request = contract.SnapshotRequest{ .search_job_id = self.data.search_job_id };
+        const request = if (operation == contract.op_restart)
+            self.restart.request(self.data.search_job_id, false) orelse return
+        else
+            contract.SnapshotRequest{ .search_job_id = self.data.search_job_id };
         switch (connection.callTyped(
             contract.SnapshotRequest,
             contract.Ack,
@@ -348,7 +351,7 @@ const App = struct {
                 }
                 self.active_job = ack.job_id;
                 self.service_busy = true;
-                if (operation == contract.op_update_all) self.restart_ready = false;
+                self.restart = .{};
                 self.setStatus(if (operation == contract.op_restart) "Committing restart batch..." else "Updating all packages...", false);
             },
             .timed_out => {
@@ -546,7 +549,7 @@ const App = struct {
         _ = canvas.button(.{
             .rect = self.searchRect(),
             .text = "Search for Updates",
-            .state = if (self.service_busy) .disabled else if (self.pressed == .search) .pressed else .normal,
+            .state = if (!self.restart.searchEnabled(self.service_busy or self.loading or self.load_io != 0)) .disabled else if (self.pressed == .search) .pressed else .normal,
             .palette = palette,
         }, scratch);
         _ = canvas.button(.{
@@ -666,13 +669,13 @@ const App = struct {
         const rect = self.statusRect();
         _ = canvas.rect(rect, color_shadow);
         _ = canvas.rect(rect.inset(1, 1), color_bg);
-        const restart_visible = self.restart_ready;
+        const restart_visible = self.restart.search_job_id != 0;
         const reserved_width: i32 = if (restart_visible) 142 else 12;
         _ = canvas.textClipped(rect.x + 6, rect.y + 5, rect.w - reserved_width, scratch, self.status[0..self.status_len], if (self.status_is_error) color_error else color_text, color_bg);
         if (restart_visible) _ = canvas.button(.{
             .rect = self.restartRect(),
             .text = "Restart R4OS",
-            .state = if (self.service_busy) .disabled else if (self.pressed == .restart) .pressed else .normal,
+            .state = if (self.restart.request(self.data.search_job_id, self.service_busy or self.loading or self.load_io != 0) == null) .disabled else if (self.pressed == .restart) .pressed else .normal,
             .palette = palette,
         }, scratch);
     }
@@ -688,9 +691,9 @@ const App = struct {
 
     fn handleMouseDown(self: *App, x: i32, y: i32) void {
         self.pressed = .none;
-        if (self.searchRect().contains(x, y) and !self.service_busy) self.pressed = .search;
+        if (self.searchRect().contains(x, y) and self.restart.searchEnabled(self.service_busy or self.loading or self.load_io != 0)) self.pressed = .search;
         if (self.updateAllRect().contains(x, y) and self.data.updateAllEnabled(self.service_busy)) self.pressed = .update_all;
-        if (self.restart_ready and self.restartRect().contains(x, y) and !self.service_busy) self.pressed = .restart;
+        if (self.restart.request(self.data.search_job_id, self.service_busy or self.loading or self.load_io != 0) != null and self.restartRect().contains(x, y)) self.pressed = .restart;
         if (self.listUpRect().contains(x, y) and self.data.scroll > 0) self.pressed = .list_up;
         if (self.listDownRect().contains(x, y) and
             self.data.scroll + self.visiblePackageRows() < self.data.package_count) self.pressed = .list_down;

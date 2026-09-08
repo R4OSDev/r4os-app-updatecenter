@@ -4,6 +4,23 @@ const contract = @import("update_service_contract");
 pub const max_packages: usize = 64;
 pub const max_components: usize = 192;
 
+pub const RestartBinding = struct {
+    search_job_id: u32 = 0,
+
+    pub fn observe(self: *RestartBinding, status: contract.Status) void {
+        self.search_job_id = if (Model.restartReadyFromStatus(status, (status.flags & contract.flag_busy) != 0)) status.source_job_id else 0;
+    }
+
+    pub fn searchEnabled(self: RestartBinding, busy: bool) bool {
+        return !busy and self.search_job_id == 0;
+    }
+
+    pub fn request(self: RestartBinding, displayed_search_job_id: u32, busy: bool) ?contract.SnapshotRequest {
+        if (busy or self.search_job_id == 0 or self.search_job_id != displayed_search_job_id) return null;
+        return .{ .search_job_id = self.search_job_id };
+    }
+};
+
 pub const SessionState = enum(u8) {
     available,
     downloading,
@@ -146,7 +163,11 @@ pub const Model = struct {
     }
 
     pub fn restartReadyFromStatus(status: contract.Status, service_busy: bool) bool {
-        if (service_busy or !status.valid() or status.result != contract.result_ok) return false;
+        if (service_busy or !status.valid() or status.source_job_id == 0 or
+            (status.flags & contract.flag_restart_required) == 0) return false;
+        // The service retains a prepared batch after a returned commit error.
+        if (status.operation == contract.op_restart) return true;
+        if (status.result != contract.result_ok) return false;
         if (status.operation != contract.op_install and status.operation != contract.op_update_all) return false;
         return contract.stateFromWire(status.state) == .pending_restart and
             (status.flags & contract.flag_restart_required) != 0;
@@ -514,6 +535,7 @@ test "reopened client can bind an active service job to its search package" {
 
 test "individual and update all completion expose only a prepared restart" {
     const ready = contract.Status{
+        .source_job_id = 29,
         .operation = contract.op_install,
         .state = @intFromEnum(contract.State.pending_restart),
         .flags = contract.flag_restart_required,
@@ -529,4 +551,18 @@ test "individual and update all completion expose only a prepared restart" {
     failed.result = contract.result_invalid;
     try std.testing.expect(!Model.restartReadyFromStatus(failed, false));
     try std.testing.expect(!Model.restartReadyFromStatus(ready, true));
+    var binding = RestartBinding{};
+    binding.observe(ready);
+    try std.testing.expect(!binding.searchEnabled(false));
+    try std.testing.expectEqual(@as(u32, 29), binding.request(29, false).?.search_job_id);
+    try std.testing.expect(binding.request(30, false) == null);
+    try std.testing.expect(binding.request(29, true) == null);
+    var unbound = ready;
+    unbound.source_job_id = 0;
+    binding.observe(unbound);
+    try std.testing.expect(binding.request(29, false) == null);
+    binding.observe(ready);
+    binding.observe(.{ .job_id = 30, .operation = contract.op_search, .state = @intFromEnum(contract.State.available) });
+    try std.testing.expect(binding.searchEnabled(false));
+    try std.testing.expect(binding.request(30, false) == null);
 }
